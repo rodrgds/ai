@@ -1,5 +1,12 @@
 # @ai-sdk/harness-cline
 
+## 1.0.45
+
+### Patch Changes
+
+- Updated dependencies [b2baeba]
+  - @ai-sdk/harness@1.0.118
+
 ## 1.0.44
 
 ### Patch Changes

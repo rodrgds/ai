@@ -1,5 +1,13 @@
 # @ai-sdk/harness
 
+## 1.0.118
+
+### Patch Changes
+
+- b2baeba: fix(harness): preserve work directory text inside longer path segments
+- Updated dependencies [6317504]
+  - ai@7.0.108
+
 ## 1.0.117
 
 ### Patch Changes

@@ -1,5 +1,15 @@
 # @ai-sdk/harness-grok-build
 
+## 1.0.55
+
+### Patch Changes
+
+- c0e5d1d: feat(harness): allow consumers of bridge backed harnesses to configure `reconnect` timeout
+- Updated dependencies [b2baeba]
+- Updated dependencies [c0e5d1d]
+  - @ai-sdk/harness@1.0.118
+  - @ai-sdk/harness-acp@1.0.56
+
 ## 1.0.54
 
 ### Patch Changes

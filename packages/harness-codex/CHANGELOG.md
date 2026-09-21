@@ -1,5 +1,14 @@
 # @ai-sdk/harness-codex
 
+## 1.0.120
+
+### Patch Changes
+
+- 7040da0: fix(harness-codex): fix empty `query` value for `web_search` tool calls
+- c0e5d1d: feat(harness): allow consumers of bridge backed harnesses to configure `reconnect` timeout
+- Updated dependencies [b2baeba]
+  - @ai-sdk/harness@1.0.118
+
 ## 1.0.119
 
 ### Patch Changes

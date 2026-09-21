@@ -1,5 +1,13 @@
 # @ai-sdk/harness-deepagents
 
+## 1.0.118
+
+### Patch Changes
+
+- c0e5d1d: feat(harness): allow consumers of bridge backed harnesses to configure `reconnect` timeout
+- Updated dependencies [b2baeba]
+  - @ai-sdk/harness@1.0.118
+
 ## 1.0.117
 
 ### Patch Changes

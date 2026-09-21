@@ -1,5 +1,14 @@
 # @ai-sdk/harness-opencode
 
+## 1.0.120
+
+### Patch Changes
+
+- 01a671a: fix(harness-opencode): allow external directory access with `permissionMode: "allow-all"`
+- 80b969d: feat(harness-opencode): allow consumers to configure bridge reconnect timing
+- Updated dependencies [b2baeba]
+  - @ai-sdk/harness@1.0.118
+
 ## 1.0.119
 
 ### Patch Changes
