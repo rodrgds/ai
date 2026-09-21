@@ -144,8 +144,12 @@ export async function convertToAnthropicPrompt({
 
     switch (type) {
       case 'system': {
-        const content: AnthropicSystemMessage['content'] = [];
-        let toolChangeCount = 0;
+        const convertedMessages: Array<{
+          content: AnthropicSystemMessage['content'];
+          clearAt?: 'next_user_message';
+          effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+          toolChangeCount: number;
+        }> = [];
 
         for (const { content: text, providerOptions } of block.messages) {
           const systemMessageOptions = await parseProviderOptions({
@@ -154,10 +158,16 @@ export async function convertToAnthropicPrompt({
             schema: anthropicSystemMessageProviderOptions,
           });
           const toolChanges = systemMessageOptions?.toolChanges ?? [];
+          const content: AnthropicSystemMessage['content'] = [];
 
-          // A system message that only carries tool changes may have empty
-          // text; do not emit an empty text block for it.
-          if (text !== '' || toolChanges.length === 0) {
+          // A system message that only carries message-level controls may have
+          // empty text; do not emit an empty text block for it.
+          if (
+            text !== '' ||
+            (toolChanges.length === 0 &&
+              systemMessageOptions?.clearAt == null &&
+              systemMessageOptions?.effort == null)
+          ) {
             content.push({
               type: 'text' as const,
               text,
@@ -169,7 +179,6 @@ export async function convertToAnthropicPrompt({
           }
 
           for (const toolChange of toolChanges) {
-            toolChangeCount++;
             content.push({
               type: toolChange.type,
               tool: {
@@ -178,6 +187,13 @@ export async function convertToAnthropicPrompt({
               },
             } satisfies AnthropicToolChangeContent);
           }
+
+          convertedMessages.push({
+            content,
+            clearAt: systemMessageOptions?.clearAt,
+            effort: systemMessageOptions?.effort,
+            toolChangeCount: toolChanges.length,
+          });
         }
 
         // The first block becomes the top-level system prompt. Later system
@@ -185,7 +201,17 @@ export async function convertToAnthropicPrompt({
         // tool changes (which are only valid mid-conversation), and otherwise
         // only when a top-level system prompt already exists (preserving the
         // existing hoisting behavior for plain text).
-        if (i === 0 || (system == null && toolChangeCount === 0)) {
+        const toolChangeCount = convertedMessages.reduce(
+          (count, message) => count + message.toolChangeCount,
+          0,
+        );
+        const hasInlineSystemOptions = convertedMessages.some(
+          message => message.clearAt != null || message.effort != null,
+        );
+        if (
+          i === 0 ||
+          (system == null && toolChangeCount === 0 && !hasInlineSystemOptions)
+        ) {
           if (toolChangeCount > 0) {
             warnings.push({
               type: 'other',
@@ -195,14 +221,45 @@ export async function convertToAnthropicPrompt({
                 'The tool changes have been ignored.',
             });
           }
-          system = content.filter(
-            (part): part is AnthropicTextContent => part.type === 'text',
+
+          for (const message of convertedMessages) {
+            if (message.clearAt != null || message.effort != null) {
+              warnings.push({
+                type: 'other',
+                message:
+                  'clearAt and effort on the initial system message are not supported by Anthropic. ' +
+                  'These options have been ignored.',
+              });
+            }
+          }
+
+          system = convertedMessages.flatMap(message =>
+            message.content.filter(
+              (part): part is AnthropicTextContent => part.type === 'text',
+            ),
           );
         } else {
-          messages.push({ role: 'system', content });
           betas.add('mid-conversation-system-2026-04-07');
-          if (toolChangeCount > 0) {
-            betas.add('mid-conversation-tool-changes-2026-07-01');
+
+          for (const message of convertedMessages) {
+            messages.push({
+              role: 'system',
+              content: message.content,
+              ...(message.clearAt != null && { clear_at: message.clearAt }),
+              ...(message.effort != null && {
+                output_config: { effort: message.effort },
+              }),
+            });
+
+            if (message.toolChangeCount > 0) {
+              betas.add('mid-conversation-tool-changes-2026-07-01');
+            }
+            if (message.clearAt != null) {
+              betas.add('mid-conversation-system-clear-at-2026-08-21');
+            }
+            if (message.effort != null) {
+              betas.add('mid-conversation-effort-2026-08-01');
+            }
           }
         }
 
@@ -950,7 +1007,8 @@ export async function convertToAnthropicPrompt({
                   }
 
                   // to distinguish between code execution 20250522, 20250825,
-                  // and encrypted results (from web_fetch_20260209/web_search_20260209 injection),
+                  // and encrypted results from implicitly provisioned code
+                  // execution for dynamic web tools,
                   // we check the type property in output.value
                   if (output.value.type === 'code_execution_result') {
                     // code execution 20250522
@@ -1083,9 +1141,9 @@ export async function convertToAnthropicPrompt({
                     break;
                   }
 
-                  // ideally we'd switch schema based on the tool version (e.g.
-                  // web_fetch_20260209 vs web_fetch_20250910), but since both
-                  // versions share an identical output schema, we use one here.
+                  // ideally we'd switch schema based on the tool version, but
+                  // all supported versions share an identical output schema,
+                  // so we use one here.
                   const webFetchOutput = await validateTypes({
                     value: output.value,
                     schema: webFetch_20250910OutputSchema,
@@ -1148,9 +1206,9 @@ export async function convertToAnthropicPrompt({
                     break;
                   }
 
-                  // ideally we'd switch schema based on the tool version (e.g.
-                  // web_search_20260209 vs web_search_20250305), but since both
-                  // versions share an identical output schema, we use one here.
+                  // ideally we'd switch schema based on the tool version, but
+                  // all supported versions share an identical output schema,
+                  // so we use one here.
                   const webSearchOutput = await validateTypes({
                     value: output.value,
                     schema: webSearch_20250305OutputSchema,

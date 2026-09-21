@@ -9,6 +9,7 @@ import {
   type HarnessV1BuiltinTool,
   type HarnessV1ContinueTurnState,
   type HarnessV1CredentialForwarding,
+  type HarnessV1MintBridgeTokenCallback,
   type HarnessV1Prompt,
   type HarnessV1PromptControl,
   type HarnessV1PortEndpoint,
@@ -38,8 +39,8 @@ import {
   warnCredentialBrokeringUnavailable,
   waitForBridgeReady,
   withBridgeToken,
-  writeSkills as writeHarnessSkills,
-  type WriteSkillsResult,
+  writeSkills,
+  type SandboxChannelReconnectOptions,
 } from '@ai-sdk/harness/utils';
 import {
   type Experimental_SandboxProcess,
@@ -53,12 +54,14 @@ import {
 } from './codex-bootstrap';
 import {
   CODEX_CREDENTIAL_ENVIRONMENT_VARIABLES,
-  createCodexRequestTransformations,
   DEFAULT_OPENAI_BASE_URL,
   resolveCodexAuthenticationMode,
-  resolveCodexEnv,
   type CodexAuthenticationMode,
 } from './codex-auth';
+import {
+  createCodexSubscriptionRequestTransformations,
+  resolveCodexAuthentication,
+} from './codex-subscription';
 import {
   outboundMessageSchema,
   type InboundMessage,
@@ -107,13 +110,6 @@ export type CodexHarnessSettings = {
    */
   readonly mcpServers?: Record<string, unknown>;
   /**
-   * OpenAI model id the underlying `codex` CLI should use. Leaving this unset
-   * pins the adapter default (`DEFAULT_CODEX_MODEL`).
-   *
-   * @deprecated Use `model` on `HarnessAgent` instead.
-   */
-  readonly model?: string;
-  /**
    * Reasoning effort for reasoning-capable models. Leaving this unset
    * defers to the CLI's default.
    */
@@ -137,10 +133,16 @@ export type CodexHarnessSettings = {
   /** Maximum milliseconds to wait for the bridge to advertise its port. Defaults to 120000. */
   readonly startupTimeoutMs?: number;
   /**
+   * Configures reconnection attempts after an established bridge connection
+   * drops. Defaults to a 30 second reconnect window with exponential backoff
+   * from 50 milliseconds up to 2 seconds.
+   */
+  readonly reconnect?: SandboxChannelReconnectOptions;
+  /**
    * Creates the authentication token used by the sandbox bridge. Defaults to
    * a random 32-byte hexadecimal token.
    */
-  readonly mintBridgeToken?: (sandboxId: string) => string;
+  readonly mintBridgeToken?: HarnessV1MintBridgeTokenCallback;
 };
 
 /*
@@ -208,7 +210,7 @@ export function createCodex(
     lifecycleStateSchema: codexResumeStateSchema,
     getBootstrap: getCodexBootstrap,
     doStart: async startOpts => {
-      const model = settings.model ?? DEFAULT_CODEX_MODEL;
+      const model = DEFAULT_CODEX_MODEL;
       if (startOpts.builtinToolFiltering != null) {
         throw new HarnessCapabilityUnsupportedError({
           message:
@@ -270,7 +272,12 @@ export function createCodex(
           : undefined;
       const coords = resumeData?.bridge;
       const authenticationMode = resolveCodexAuthenticationMode(settings.auth);
-      const resolvedAuthEnvironment = resolveCodexEnv(settings.auth);
+      const resolvedAuthentication = await resolveCodexAuthentication({
+        auth: settings.auth,
+        authCredentialsStoreMode:
+          settings.codexConfig?.cli_auth_credentials_store,
+      });
+      const resolvedAuthEnvironment = resolvedAuthentication.environment;
       let sandboxAuthEnvironment = resolvedAuthEnvironment;
       let sandboxCredentialEnvironment: Record<string, string> | undefined;
       let credentialsBrokered = false;
@@ -290,11 +297,13 @@ export function createCodex(
           ...resolvedAuthEnvironment,
           ...sandboxCredentialEnvironment,
         };
-        const requestTransformations = createCodexRequestTransformations({
-          env: resolvedAuthEnvironment,
-          sandboxEnv: sandboxAuthEnvironment,
-          auth: authenticationMode,
-        });
+        const requestTransformations =
+          createCodexSubscriptionRequestTransformations({
+            env: resolvedAuthEnvironment,
+            sandboxEnv: sandboxAuthEnvironment,
+            auth: authenticationMode,
+            requestHeaders: resolvedAuthentication.requestHeaders,
+          });
         if (requestTransformations.length > 0) {
           await sandboxSession.addRequestTransformations(
             requestTransformations,
@@ -314,8 +323,6 @@ export function createCodex(
            */
           sandboxAuthEnvironment.OPENAI_BASE_URL = DEFAULT_OPENAI_BASE_URL;
         }
-      } else {
-        warnCredentialBrokeringUnavailable();
       }
       // Harness SDK state (bootstrap, per-session runs) lives in the
       // provider's state directory, which is the working directory unless the
@@ -383,6 +390,7 @@ export function createCodex(
             initialLastSeenEventId: coords.lastSeenEventId,
             onDiagnostic,
             onBridgeError,
+            reconnect: settings.reconnect,
           });
           await attachChannel.open(isContinue ? { resume: true } : undefined);
           return createSession({
@@ -396,6 +404,7 @@ export function createCodex(
             webSearch: settings.webSearch,
             codexConfig: settings.codexConfig,
             mcpServers: settings.mcpServers,
+            headers: startOpts.headers,
             resumeThreadId: resumeThreadIdString,
             isResume: true,
             seedResumeThreadOnFirstPrompt: false,
@@ -454,6 +463,14 @@ export function createCodex(
               CODEX_CREDENTIAL_ENVIRONMENT_VARIABLES,
             credentialForwarding: settings.credentialForwarding,
           });
+      if (!credentialsBrokered) {
+        warnCredentialBrokeringUnavailable({
+          environment: resolvedAuthEnvironment,
+          forwardedEnvironment: forwardedAuthEnvironment,
+          credentialEnvironmentVariables:
+            CODEX_CREDENTIAL_ENVIRONMENT_VARIABLES,
+        });
+      }
       const env = {
         ...forwardedAuthEnvironment,
         AI_SDK_HARNESS_CLIENT_APP: CODEX_CLIENT_APP,
@@ -529,6 +546,7 @@ export function createCodex(
         outboundSchema: outboundMessageSchema,
         onDiagnostic,
         onBridgeError,
+        reconnect: settings.reconnect,
         // In replay mode the respawned bridge reloaded the finished turn from
         // disk; seed the cursor and resume so it streams the tail (incl.
         // `finish`).
@@ -550,6 +568,7 @@ export function createCodex(
         webSearch: settings.webSearch,
         codexConfig: settings.codexConfig,
         mcpServers: settings.mcpServers,
+        headers: startOpts.headers,
         resumeThreadId: resumeThreadIdString,
         isResume: respawnStrategy !== undefined,
         seedResumeThreadOnFirstPrompt: respawnStrategy !== undefined,
@@ -633,29 +652,6 @@ async function resolveBridgeEndpoint({
   });
 }
 
-async function writeCodexSkills({
-  sandbox,
-  sandboxHomeDir,
-  skills,
-  abortSignal,
-}: {
-  sandbox: SandboxSession;
-  sandboxHomeDir: string;
-  skills: ReadonlyArray<HarnessV1Skill>;
-  abortSignal?: AbortSignal;
-}): Promise<WriteSkillsResult> {
-  const rootDir = path.posix.join(sandboxHomeDir, '.agents', 'skills');
-  return writeHarnessSkills({
-    sandbox,
-    rootDir,
-    skills,
-    abortSignal,
-    invalidSkillNameMessage: ({ name }) => `Invalid Codex skill name: ${name}`,
-    invalidSkillFilePathMessage: ({ skillName, filePath }) =>
-      `Invalid Codex skill file path for ${skillName}: ${filePath}`,
-  });
-}
-
 function openWebSocket({
   url,
   headers,
@@ -687,6 +683,7 @@ function createSession({
   webSearch,
   codexConfig,
   mcpServers,
+  headers,
   resumeThreadId,
   isResume,
   seedResumeThreadOnFirstPrompt,
@@ -711,6 +708,7 @@ function createSession({
   webSearch: boolean | undefined;
   codexConfig: Record<string, unknown> | undefined;
   mcpServers: Record<string, unknown> | undefined;
+  headers: Readonly<Record<string, string>> | undefined;
   resumeThreadId: string | undefined;
   isResume: boolean;
   seedResumeThreadOnFirstPrompt: boolean;
@@ -770,11 +768,16 @@ function createSession({
     }>;
     abortSignal?: AbortSignal;
   }): Promise<{ restartThread: boolean }> => {
-    const skillsResult = await writeCodexSkills({
+    const skillsResult = await writeSkills({
       sandbox,
-      sandboxHomeDir,
+      homePath: sandboxHomeDir,
+      skillsDir: '.agents/skills',
       skills,
       abortSignal,
+      invalidSkillNameMessage: ({ name }) =>
+        `Invalid Codex skill name: ${name}`,
+      invalidSkillFilePathMessage: ({ skillName, filePath }) =>
+        `Invalid Codex skill file path for ${skillName}: ${filePath}`,
     });
     const nextFingerprint = fingerprintCodexTurnConfiguration({
       instructions,
@@ -1013,6 +1016,7 @@ function createSession({
         webSearch,
         ...(codexConfig == null ? {} : { codexConfig }),
         ...(mcpServers == null ? {} : { mcpServers }),
+        ...(headers == null ? {} : { headers }),
         ...(permissionMode ? { permissionMode } : {}),
         ...(pendingResumeThreadId
           ? { resumeThreadId: pendingResumeThreadId }
@@ -1090,6 +1094,7 @@ function createSession({
             webSearch,
             ...(codexConfig == null ? {} : { codexConfig }),
             ...(mcpServers == null ? {} : { mcpServers }),
+            ...(headers == null ? {} : { headers }),
             ...(permissionMode ? { permissionMode } : {}),
             ...(threadId ? { resumeThreadId: threadId } : {}),
             ...(restartThread ? { restartThread: true } : {}),

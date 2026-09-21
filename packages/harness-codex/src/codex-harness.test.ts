@@ -11,6 +11,7 @@ const sentMessages: unknown[] = [];
 const channelMocks = vi.hoisted(() => ({
   connectOnOpen: false,
   connects: [] as Array<() => Promise<unknown>>,
+  reconnects: [] as Array<unknown>,
 }));
 const webSocketMocks = vi.hoisted(() => {
   type Listener = (...args: unknown[]) => void;
@@ -58,8 +59,15 @@ vi.mock('ws', () => ({ WebSocket: webSocketMocks.WebSocket }));
 vi.mock('@ai-sdk/harness/utils', async importOriginal => {
   const actual = await importOriginal<typeof HarnessUtils>();
   class FakeSandboxChannel {
-    constructor({ connect }: { connect: () => Promise<unknown> }) {
+    constructor({
+      connect,
+      reconnect,
+    }: {
+      connect: () => Promise<unknown>;
+      reconnect?: unknown;
+    }) {
       channelMocks.connects.push(connect);
+      channelMocks.reconnects.push(reconnect);
     }
     async open(): Promise<void> {
       if (channelMocks.connectOnOpen) {
@@ -194,6 +202,7 @@ describe('createCodex adapter', () => {
     sentMessages.length = 0;
     channelMocks.connectOnOpen = false;
     channelMocks.connects.length = 0;
+    channelMocks.reconnects.length = 0;
     webSocketMocks.calls.length = 0;
   });
 
@@ -383,9 +392,8 @@ describe('createCodex adapter', () => {
     await session.doDestroy();
   });
 
-  it('prefers the per-turn model over the deprecated adapter model', async () => {
-    const harness = createCodex({ model: 'legacy-model' });
-    const session = await harness.doStart({
+  it('falls back to the default model, overridden by the per-turn model', async () => {
+    const session = await createCodex().doStart({
       sessionId: 's1',
       sandboxSession: fakeNetworkSandboxSessionForStartupSuccess({
         bridgePortUrl: 'ws://127.0.0.1:1',
@@ -395,14 +403,29 @@ describe('createCodex adapter', () => {
       }),
       sessionWorkDir: '/vercel/sandbox/codex-s1',
     });
-    const control = await session.doPromptTurn({
-      model: 'agent-model',
+    const firstControl = await session.doPromptTurn({
       skills: [],
       tools: [],
       prompt: 'Hello',
       emit: () => {},
     });
-    void Promise.resolve(control.done).catch(() => {});
+    void Promise.resolve(firstControl.done).catch(() => {});
+
+    await vi.waitFor(() => {
+      expect(sentMessages.at(-1)).toMatchObject({
+        type: 'start',
+        model: 'gpt-5.5',
+      });
+    });
+
+    const secondControl = await session.doPromptTurn({
+      model: 'agent-model',
+      skills: [],
+      tools: [],
+      prompt: 'Hello again',
+      emit: () => {},
+    });
+    void Promise.resolve(secondControl.done).catch(() => {});
 
     await vi.waitFor(() => {
       expect(sentMessages.at(-1)).toMatchObject({
@@ -411,6 +434,66 @@ describe('createCodex adapter', () => {
       });
     });
     await session.doDestroy();
+  });
+
+  it('passes headers to the bridge for Gateway and direct auth', async () => {
+    const gatewaySession = await createCodex({
+      auth: { AI_GATEWAY_API_KEY: 'gateway-key' },
+    }).doStart({
+      sessionId: 'gateway',
+      headers: { 'x-tenant': 'acme' },
+      sandboxSession: fakeNetworkSandboxSessionForStartupSuccess({
+        bridgePortUrl: 'ws://127.0.0.1:1',
+        runs: [],
+        spawns: [],
+        writes: [],
+      }),
+      sessionWorkDir: '/vercel/sandbox/codex-gateway',
+    });
+    const gatewayControl = await gatewaySession.doPromptTurn({
+      skills: [],
+      tools: [],
+      prompt: 'Hello',
+      emit: () => {},
+    });
+    void Promise.resolve(gatewayControl.done).catch(() => {});
+
+    await vi.waitFor(() => {
+      expect(sentMessages.at(-1)).toMatchObject({
+        type: 'start',
+        headers: { 'x-tenant': 'acme' },
+      });
+    });
+    await gatewaySession.doDestroy();
+
+    const directSession = await createCodex({
+      auth: { OPENAI_API_KEY: 'openai-key' },
+    }).doStart({
+      sessionId: 'direct',
+      headers: { 'x-tenant': 'acme' },
+      sandboxSession: fakeNetworkSandboxSessionForStartupSuccess({
+        bridgePortUrl: 'ws://127.0.0.1:1',
+        runs: [],
+        spawns: [],
+        writes: [],
+      }),
+      sessionWorkDir: '/vercel/sandbox/codex-direct',
+    });
+    const directControl = await directSession.doPromptTurn({
+      skills: [],
+      tools: [],
+      prompt: 'Hello',
+      emit: () => {},
+    });
+    void Promise.resolve(directControl.done).catch(() => {});
+
+    await vi.waitFor(() => {
+      expect(sentMessages.at(-1)).toMatchObject({
+        type: 'start',
+        headers: { 'x-tenant': 'acme' },
+      });
+    });
+    await directSession.doDestroy();
   });
 
   it('brokers credentials when the sandbox supports additive request transformations', async () => {
@@ -475,6 +558,7 @@ describe('createCodex adapter', () => {
   });
 
   it('customizes real credentials when request transformations are unavailable', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const spawnEnvs: Array<Record<string, string | undefined>> = [];
     const forwardedCredentials: Array<{
       credential: string;
@@ -510,8 +594,36 @@ describe('createCodex adapter', () => {
     ]);
     expect(spawnEnvs.at(0)?.CODEX_API_KEY).toBe('caller-managed-credential');
     expect(JSON.stringify(spawnEnvs.at(0))).not.toContain('openai-secret');
+    expect(warn).not.toHaveBeenCalled();
 
     await session.doDestroy();
+
+    const identityHarness = createCodex({
+      auth: { OPENAI_API_KEY: 'openai-secret' },
+      credentialForwarding: ({ credential }) => credential,
+    });
+    const identitySandboxSession = fakeNetworkSandboxSessionForStartupSuccess({
+      bridgePortUrl: 'ws://127.0.0.1:1',
+      runs: [],
+      spawns: [],
+      spawnEnvs: [],
+      writes: [],
+    });
+    Object.assign(identitySandboxSession, {
+      addRequestTransformations: undefined,
+    });
+    const identitySession = await identityHarness.doStart({
+      sessionId: 's2',
+      sandboxSession: identitySandboxSession,
+      sessionWorkDir: '/vercel/sandbox/codex-s2',
+    });
+
+    expect(warn).toHaveBeenCalledExactlyOnceWith(
+      'The sandbox implementation does not support configuring request transformations, so credential brokering does not work. Falling back to less secure credential forwarding.',
+    );
+
+    await identitySession.doDestroy();
+    warn.mockRestore();
   });
 
   it('configures the standard OpenAI URL for brokered direct auth', async () => {
@@ -633,7 +745,12 @@ describe('createCodex adapter', () => {
     const mintBridgeToken = vi.fn(
       (sandboxId: string) => `token-for-${sandboxId}`,
     );
-    const harness = createCodex({ mintBridgeToken });
+    const reconnect = {
+      maxElapsedMs: 120_000,
+      initialDelayMs: 100,
+      maxDelayMs: 5_000,
+    };
+    const harness = createCodex({ mintBridgeToken, reconnect });
     const sandboxSession = fakeNetworkSandboxSessionForStartupSuccess({
       bridgePortUrl: 'ws://127.0.0.1:1',
       runs,
@@ -664,6 +781,7 @@ describe('createCodex adapter', () => {
       resumeFrom,
     });
     expect(mintBridgeToken).toHaveBeenCalledTimes(1);
+    expect(channelMocks.reconnects).toEqual([reconnect, reconnect]);
     await attachedSession.doDetach();
   });
 
@@ -741,9 +859,9 @@ describe('createCodex adapter', () => {
     });
 
     it('shares the getter across configured harness instances', () => {
-      const first = createCodex({ model: 'first-model' });
+      const first = createCodex({ reasoningEffort: 'low' });
       const second = createCodex({
-        model: 'second-model',
+        reasoningEffort: 'high',
         webSearch: true,
       });
 
